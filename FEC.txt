@@ -1,0 +1,241 @@
+CREATE OR REPLACE procedure APPS.Create_FEC(p_Ledger number, p_FromFiscalYear number, p_ToFiscalYear number)
+is
+    v_FEC_fileid UTL_FILE.FILE_TYPE;
+    v_FilePath varchar2(200);
+    v_FileName varchar2(100);
+    v_Siren varchar2(15);
+    v_PeriodYear number;
+    
+    -- Cursor to get all the fiscal periods
+    cursor c_period is
+        select  period_name, period_year, period_num
+        from    apps.gl_periods gp2
+        where gp2.period_set_name = 'SOITEC_CALENDAR'
+        and (period_year >= p_FromFiscalYear and period_year <= p_ToFiscalYear)
+        order by period_year, period_num;
+        
+    -- Cursor to get all the data
+    cursor c_FEC(cv_Ledger in number, cv_period in varchar2) is
+        select
+            cat.user_je_category_name JournalCode,
+            replace(h.name,'|','+') JournalLib, 
+            h.doc_sequence_value EcritureNum, 
+            to_char(h.posted_date,'YYYYMMDD') EcritureDate,
+            decode(substr(cc.SEGMENT3,1,3), 'TEC','471000',cc.SEGMENT3) CompteNum,
+            fvt.description CompteLib,
+            case 
+                when cat.user_je_category_name in ('Chargebacks', 'Receipts', 'Sales Invoices', 'Misc Receipts')
+                then (
+                        select c.account_number
+                        from apps.xla_ae_lines ael
+                            join apps.hz_cust_accounts c on (c.cust_account_id = ael.party_id)
+                        where ael.gl_sl_link_id = l.gl_sl_link_id
+                     )
+                when cat.user_je_category_name in ('Purchase Invoices', 'Payments', 'Reconciled Payments', 'Receiving')
+                then (
+                        select v.segment1 Vendor_num
+                        from apps.xla_ae_lines ael
+                            join apps.po_vendors v on (v.vendor_id = ael.party_id)
+                        where ael.gl_sl_link_id = l.gl_sl_link_id
+                     )
+                else
+                    null
+            end CompAuxNum,
+            case 
+                when cat.user_je_category_name in ('Chargebacks', 'Receipts', 'Sales Invoices', 'Misc Receipts')
+                then (
+                    select hzp.party_name
+                    from apps.xla_ae_lines ael
+                        join apps.hz_cust_accounts c on (c.cust_account_id = ael.party_id)
+                        join apps.hz_parties hzp on (hzp.party_id = c.party_id)
+                    where ael.gl_sl_link_id = l.gl_sl_link_id
+                    )
+                when cat.user_je_category_name in ('Purchase Invoices', 'Payments', 'Reconciled Payments', 'Receiving')
+                then (
+                        select v.vendor_name
+                        from apps.xla_ae_lines ael
+                            join apps.po_vendors v on (v.vendor_id = ael.party_id)
+                        where ael.gl_sl_link_id = l.gl_sl_link_id
+                     )
+                else
+                    null
+            end CompAuxLib,
+            h.doc_sequence_value  PieceRef,
+            to_char(h.DEFAULT_EFFECTIVE_DATE,'YYYYMMDD') PieceDate,
+            replace(replace(replace(nvl(l.DESCRIPTION,h.name), '|', '+'),CHR(13),' '),CHR(10),' ') EcritureLib,
+            l.ACCOUNTED_DR Debit, 
+            l.ACCOUNTED_CR Credit, 
+            r.jgzz_recon_ref EcritureLet,
+            r.jgzz_recon_date DateLet,
+            to_char(l.effective_date,'YYYYMMDD') ValidDate,
+            nvl(l.ENTERED_DR, l.ENTERED_CR) MontantDevise,
+            h.CURRENCY_CODE idevise
+        from                apps.gl_je_lines l
+            join            apps.gl_je_headers h on (h.JE_HEADER_ID = l.JE_HEADER_ID)
+            join            apps.GL_JE_CATEGORIES_TL cat on (cat.JE_CATEGORY_NAME = h.JE_CATEGORY)
+            join            apps.gl_code_combinations_kfv cc on (cc.code_combination_id = l.CODE_COMBINATION_ID)
+            join            apps.FND_FLEX_VALUES fv on (fv.flex_value = cc.segment3 and fv.flex_value_set_id= 1014876)
+            join            apps.FND_FLEX_VALUES_tl fvt on (fvt.flex_value_id = fv.flex_value_id and fvt.language = 'US')
+            left outer join apps.gl_je_lines_recon r on (r.je_header_id = l.je_header_id and r.je_line_num = l.je_line_num)
+        where   h.PERIOD_NAME = cv_period            
+            and h.ledger_id = cv_Ledger
+            and (nvl(l.ACCOUNTED_DR,0) <> 0 or nvl(l.ACCOUNTED_CR,0) <> 0) 
+            and currency_code <> 'STAT'
+        order by EcritureDate;
+        
+    -- Cursor to get the RAN data (Report a Nouveau)
+    cursor c_RAN(cv_period in varchar2) is 
+        select
+            'Report a nouveau'           JournalCode,
+            'Report a nouveau'      JournalLib,
+            gp.period_year-1        EcritureNum,
+            to_char(gp.year_start_date, 'YYYYMMDD') EcritureDate,
+            cc.segment3 CompteNum,
+            fvt.description CompteLib,
+            null CompAuxNum,
+            null CompAuxLib,
+            gp.period_year-1  PieceRef,
+            to_char(gp.year_start_date, 'YYYYMMDD') PieceDate,
+            'Report a nouveau' EcritureLib,
+            sum(g.BEGIN_BALANCE_DR) Debit, 
+            sum(g.BEGIN_BALANCE_CR) Credit, 
+            null EcritureLet,
+            null DateLet,
+            to_char(gp.year_start_date, 'YYYYMMDD') ValidDate,
+            sum(g.BEGIN_BALANCE_DR - g.BEGIN_BALANCE_CR) MontantDevise,
+            'EUR' idevise
+        from gl_balances g, apps.gl_code_combinations_kfv cc, apps.FND_FLEX_VALUES_tl fvt, apps.FND_FLEX_VALUES fv, gl_periods gp
+        where   g.period_name= gp.PERIOD_NAME
+            and gp.PERIOD_SET_NAME = 'SOITEC_CALENDAR'
+            and gp.PERIOD_NAME = cv_period
+            and ledger_id = 2024
+            and cc.CODE_COMBINATION_ID = g.CODE_COMBINATION_ID
+            and g.CURRENCY_CODE = 'EUR'
+            and cc.SUMMARY_FLAG = 'N'
+            and fvt.flex_value_id = fv.flex_value_id and fvt.language = 'US'
+            and fv.flex_value = cc.segment3 and fv.flex_value_set_id= 1014876
+            and substr(cc.segment3,1,1) < '6' 
+        group by gp.period_year-1, to_char(gp.year_start_date, 'YYYYMMDD'), cc.segment3, fvt.description;
+            
+begin
+    DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Starting building FEC files...');
+    
+    --v_FilePath := '$XXS_TOP/FEC';
+    v_FilePath := '/prod/appl/apps_st/appl/xxs/12.0.0/sauvcla';
+    v_FileName := ' ';
+    v_PeriodYear := 0;
+    
+    DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Ledger=' || p_Ledger);
+    
+    case p_Ledger
+        when 2024 then v_Siren := '384711909'; -- Soitec SA
+        when 2045 then v_Siren := '448271395'; -- Soitec SSE
+        else v_Siren := ' ';
+    end case;
+    
+    DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Siren=' || v_Siren);
+   
+    if v_Siren <> ' ' then
+        DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Starting Period Loop');
+        -- Loop on the required periods (in order to better use the index)
+        for l_period in c_period loop
+          
+            -- Check if the fiscal year changed (if yes, prepare a new file)
+            if v_PeriodYear <> l_period.period_year then
+            
+                DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Processing year ' || l_period.period_year);
+                
+                -- Set the processing year
+                v_PeriodYear := l_period.period_year;
+                
+                -- Close previous file if open
+                if v_FEC_fileid.id is not null then
+                    UTL_FILE.FCLOSE(v_FEC_fileid);
+                end if;
+                
+                -- Create filename according to pattern
+                v_FileName := v_Siren || 'FEC' || l_period.period_year || '0331.txt'; --sirenFEC20xx0331.txt
+                
+                DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Opening File ' || v_FilePath || '/' || v_FileName);
+                
+                -- Open file
+                v_FEC_fileid := UTL_FILE.FOPEN(v_FilePath, v_FileName, 'W');
+                
+                -- Write a Header
+                UTL_FILE.PUT_LINE(v_FEC_fileid,
+                    'JournalCode|JournalLib|EcritureNum|EcritureDate|CompteNum|CompteLib|' ||
+                    'CompAuxNum|CompAuxLib|PieceRef|PieceDate|EcritureLib|Debit|' || 
+                    'Credit|EcritureLet|DateLet|ValidDate|MontantDevise|idevise'
+                    );
+            end if;
+            
+            DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Processing period ' || l_period.period_name);
+            
+            -- On the first period of the fiscal year, we aggregate some data for RAN
+            if l_period.period_num = 1 then
+                DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Processing RAN data');
+            
+                -- Loop on the RAN query results (only on first year period)
+                for l_RAN in c_RAN(l_Period.period_name) loop
+                    -- Write each line
+                    UTL_FILE.PUT_LINE(v_FEC_fileid,
+                        l_RAN.JournalCode||'|'||
+                        l_RAN.JournalLib||'|'|| 
+                        l_RAN.EcritureNum||'|'|| 
+                        l_RAN.EcritureDate||'|'||
+                        l_RAN.CompteNum||'|'||
+                        l_RAN.CompteLib||'|'||
+                        l_RAN.CompAuxNum||'|'||
+                        l_RAN.CompAuxLib||'|'||
+                        l_RAN.PieceRef||'|'||
+                        l_RAN.PieceDate||'|'||
+                        l_RAN.EcritureLib||'|'||
+                        l_RAN.Debit||'|'|| 
+                        l_RAN.Credit||'|'|| 
+                        l_RAN.EcritureLet||'|'||
+                        l_RAN.DateLet||'|'||
+                        l_RAN.ValidDate||'|'||
+                        l_RAN.MontantDevise||'|'||
+                        l_RAN.idevise
+                        );
+                end loop;
+            end if;
+            
+            DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - Processing FEC data');
+            
+            -- Loop on the query results
+            for l_FEC in c_FEC(p_Ledger, l_Period.period_name) loop
+                -- Write each line
+                UTL_FILE.PUT_LINE(v_FEC_fileid,
+                    l_FEC.JournalCode||'|'||
+                    l_FEC.JournalLib||'|'|| 
+                    l_FEC.EcritureNum||'|'|| 
+                    l_FEC.EcritureDate||'|'||
+                    l_FEC.CompteNum||'|'||
+                    l_FEC.CompteLib||'|'||
+                    l_FEC.CompAuxNum||'|'||
+                    l_FEC.CompAuxLib||'|'||
+                    l_FEC.PieceRef||'|'||
+                    l_FEC.PieceDate||'|'||
+                    l_FEC.EcritureLib||'|'||
+                    l_FEC.Debit||'|'|| 
+                    l_FEC.Credit||'|'|| 
+                    l_FEC.EcritureLet||'|'||
+                    l_FEC.DateLet||'|'||
+                    l_FEC.ValidDate||'|'||
+                    l_FEC.MontantDevise||'|'||
+                    l_FEC.idevise
+                    );
+            end loop;
+        end loop;
+        
+        -- Close the last file
+        UTL_FILE.FCLOSE(v_FEC_fileid);
+    end if;
+    DBMS_OUTPUT.PUT_LINE(to_char(sysdate,'YYYY/MM/DD HH24:MI:SS') || ' - End');
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE(SQLERRM);
+end;
+/
